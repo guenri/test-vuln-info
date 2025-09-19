@@ -1,0 +1,127 @@
+# ソースコード
+ForwardSite.py
+```python
+import asyncore
+import socket
+import urllib.parse
+import urllib.request
+import urllib.error
+import sys
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+# 3DES 固定キー（24バイト）
+KEY = b"1234567890abcdef12345678"
+# 3DES 固定IV（8バイト）
+IV = b"abcdefgh"
+
+# 3DES 復号化処理
+def decrypt_data(data):
+    cipher = Cipher(algorithms.TripleDES(KEY), modes.CBC(IV), backend=default_backend())
+    decryptor = cipher.decryptor()
+    decrypted_padded = decryptor.update(data) + decryptor.finalize()
+    return decrypted_padded[:-decrypted_padded[-1]]
+
+class HTTPRequestHandler(asyncore.dispatcher_with_send):
+    def handle_read(self):
+        self.recv_buffer = b''
+        while True:
+            try:
+                data = self.recv(8192)
+                if not data:
+                    break
+                self.recv_buffer += data
+                if b'\r\n\r\n' in self.recv_buffer:
+                    break
+            except socket.error as e:
+                if e.args[0] == 35:
+                    break
+                else:
+                    raise
+
+        if self.recv_buffer:
+            try:
+                request_line, headers_part = self.recv_buffer.split(b'\r\n', 1)
+                method, path, protocol = request_line.split(b' ')
+                parsed_url = urllib.parse.urlparse(path.decode())
+                path = parsed_url.path
+
+                if method == b"POST" and path == b"/forward":
+                    # HTTPヘッダーとボディの分離
+                    header_lines, body = headers_part.split(b"\r\n\r\n", 1)
+
+                    # 受信データ（暗号化されたリクエスト）を復号
+                    decrypted_request = decrypt_data(body)
+                    decoded_request = decrypted_request.decode()
+
+                    # 復号後のリクエストデータを解析
+                    parsed_request = urllib.parse.urlparse(decoded_request)
+                    target_url = parsed_request.geturl()
+
+                    if not target_url.startswith("http"):
+                        response_body = b"<h1>400 Bad Request</h1><p>Invalid target URL.</p>"
+                        content_type = "text/html"
+                        status_code = "400 Bad Request"
+                    else:
+                        try:
+                            # Forward 先へリクエストを送信
+                            with urllib.request.urlopen(target_url) as target_response:
+                                response_body = target_response.read()
+                                content_type = target_response.headers.get("Content-Type", "application/octet-stream")
+                                status_code = f"{target_response.getcode()} {target_response.msg}"
+                        except urllib.error.URLError as e:
+                            print(f"プロキシリクエストエラー: {e}")
+                            response_body = b"<h1>502 Bad Gateway</h1><p>Proxy request error occurred.</p>"
+                            content_type = "text/html"
+                            status_code = "502 Bad Gateway"
+
+                else:
+                    response_body = b"<h1>404 Not Found</h1>"
+                    content_type = "text/html"
+                    status_code = "404 Not Found"
+
+                response_headers = [
+                    ("Content-Type", content_type),
+                    ("Content-Length", str(len(response_body))),
+                    ("Connection", "close")
+                ]
+
+                response_header_str = "\r\n".join([f"{name}: {value}" for name, value in response_headers])
+                response = f"HTTP/1.1 {status_code}\r\n{response_header_str}\r\n\r\n".encode() + response_body
+                self.send(response)
+                self.close()
+
+            except Exception as e:
+                print(f"Error processing request: {e}")
+                self.close()
+
+    def handle_close(self):
+        self.close()
+
+class WebServer(asyncore.dispatcher):
+    def __init__(self, host, port):
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind((host, port))
+        self.listen(5)
+        print(f"Serving HTTP on port {port}...")
+
+    def handle_accept(self):
+        pair = self.accept()
+        if pair is not None:
+            sock, addr = pair
+            print(f"Incoming connection from {addr}")
+            HTTPRequestHandler(sock)
+
+if __name__ == '__main__':
+    host = 'localhost'
+    port = 8080
+    server = WebServer(host, port)
+    try:
+        asyncore.loop()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt: サーバーを停止します...")
+        asyncore.close_all()
+        print("サーバーを正常に停止しました。")
+```
